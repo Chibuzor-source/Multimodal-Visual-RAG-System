@@ -9,7 +9,6 @@ from typing import Iterable
 
 import fitz
 import pdfplumber
-from PIL import Image
 
 from backend.models.schemas import ParsedImageChunk, ParsedPdf, ParsedTextChunk
 
@@ -93,12 +92,68 @@ def _stable_chunk_id(prefix: str, doc_id: str, page: int, index: int, content: s
     return f"{prefix}_{doc_id}_{page}_{index}_{digest}"
 
 
+def _table_bboxes_by_page(pdf_path: str | Path) -> dict[int, list[fitz.Rect]]:
+    """Return detected table bounding boxes keyed by 1-based page number."""
+    table_bboxes: dict[int, list[fitz.Rect]] = {}
+    with pdfplumber.open(str(pdf_path)) as document:
+        for page_number, page in enumerate(document.pages, start=1):
+            bboxes: list[fitz.Rect] = []
+            for table in page.find_tables():
+                if table.bbox:
+                    bboxes.append(fitz.Rect(*table.bbox))
+            table_bboxes[page_number] = bboxes
+    return table_bboxes
+
+
+def _rect_overlap_ratio(rect: fitz.Rect, other: fitz.Rect) -> float:
+    """Return the fraction of rect area overlapped by another rectangle."""
+    intersection = rect & other
+    if intersection.is_empty or rect.is_empty:
+        return 0.0
+    return intersection.get_area() / rect.get_area()
+
+
+def _rect_center_inside(rect: fitz.Rect, other: fitz.Rect) -> bool:
+    """Return whether rect's center point is inside another rectangle."""
+    center = fitz.Point((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)
+    return other.contains(center)
+
+
+def _block_overlaps_table(block_rect: fitz.Rect, table_bboxes: list[fitz.Rect]) -> bool:
+    """Return whether a text block likely belongs to a detected table."""
+    return any(
+        _rect_overlap_ratio(block_rect, table_bbox) > 0.15 or _rect_center_inside(block_rect, table_bbox)
+        for table_bbox in table_bboxes
+    )
+
+
+def _page_text_without_tables(page: fitz.Page, table_bboxes: list[fitz.Rect]) -> str:
+    """Extract page text while excluding blocks that overlap table regions."""
+    if not table_bboxes:
+        return page.get_text("text")
+
+    text_blocks: list[tuple[float, float, str]] = []
+    for block in page.get_text("blocks"):
+        x0, y0, x1, y1, text = block[:5]
+        block_text = str(text).strip()
+        if not block_text:
+            continue
+        block_rect = fitz.Rect(x0, y0, x1, y1)
+        if _block_overlaps_table(block_rect, table_bboxes):
+            continue
+        text_blocks.append((float(y0), float(x0), block_text))
+
+    text_blocks.sort(key=lambda item: (item[0], item[1]))
+    return "\n\n".join(block_text for _, _, block_text in text_blocks)
+
+
 def extract_text_chunks(pdf_path: str | Path, doc_id: str, doc_name: str) -> list[ParsedTextChunk]:
-    """Extract tokenized text chunks from a PDF using PyMuPDF."""
+    """Extract tokenized text chunks from a PDF using PyMuPDF, excluding table regions."""
     chunks: list[ParsedTextChunk] = []
+    table_bboxes = _table_bboxes_by_page(pdf_path)
     with fitz.open(str(pdf_path)) as document:
         for page_number, page in enumerate(document, start=1):
-            page_text = page.get_text("text")
+            page_text = _page_text_without_tables(page, table_bboxes.get(page_number, []))
             for page_chunk_index, content in enumerate(chunk_text(page_text)):
                 chunk_index = len(chunks)
                 chunks.append(
@@ -125,11 +180,16 @@ def extract_images(pdf_path: str | Path, doc_id: str, doc_name: str, output_dir:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     images: list[ParsedImageChunk] = []
+    seen_xrefs: set[int] = set()
 
     with fitz.open(str(pdf_path)) as document:
         for page_number, page in enumerate(document, start=1):
             for image_index, image_info in enumerate(page.get_images(full=True)):
                 xref = image_info[0]
+                if xref in seen_xrefs:
+                    continue
+                seen_xrefs.add(xref)
+
                 base_image = document.extract_image(xref)
                 width = int(base_image.get("width", 0))
                 height = int(base_image.get("height", 0))
